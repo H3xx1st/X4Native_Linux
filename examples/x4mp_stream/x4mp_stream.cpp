@@ -37,6 +37,19 @@
 #include <poll.h>
 #include <cerrno>
 
+// GLIBC compatibility: avoid sqrtf, which resolves to GLIBC_2.43 and prevents
+// the extension from loading on older glibc (e.g. Ubuntu 24.04 ships 2.39).
+// Double sqrt is GLIBC_2.2.5, present on every glibc. Used for distance math
+// where a tiny float<->double promotion is irrelevant.
+static inline float fsq(float v) { return (float)sqrt((double)v); }
+
+// Provide a LOCAL sqrtf so neither our code nor any libstdc++ inline we pull in
+// imports sqrtf@GLIBC_2.43 (a symbol version absent from older glibc such as
+// Ubuntu 24.04's 2.39). This resolves to sqrt@GLIBC_2.2.5, present on every
+// glibc, with identical results. Interposing a correctly-computing math function
+// is safe.
+extern "C" float sqrtf(float x) { return (float)sqrt((double)x); }
+
 static X4NativeAPI*    g_api  = nullptr;
 static X4GameFunctions* g_game = nullptr;
 
@@ -184,6 +197,20 @@ static bool g_debug = false;             // X4MP_DEBUG=1
 // source of the prune/respawn flicker). They are still rendered and targetable;
 // their position is driven by the host pin. X4MP_INERT=0 restores local AI.
 static bool g_inert = true;
+// X4MP_GHOSTS (default 0): Option A "true thin-client" rendering. On sector
+// entry the client suppresses (RemoveComponent) its own diverged local ships in
+// the zone and renders the host's world purely as ghosts — no macro+nearest
+// binding, no pinning. Frames align (verified), so ghosts land correctly, and
+// removing the diverged local ships eliminates the wrong-binding flicker.
+static bool g_ghosts = false;
+// Region streaming (opt-in, X4MP_REGION=1): the host also streams ships within
+// g_region_m of the player (neighbouring sectors). The client keeps those ships
+// alive + bound instead of dropping them the moment they leave the current
+// sector. This pre-syncs the neighbouring sectors so a sector transition has
+// no diverged-save-position snap/glide (the highway flicker). When g_region is
+// false the existing current-sector-only zone cleanup is untouched.
+static bool  g_region = false;        // X4MP_REGION=1 enables region streaming
+static float g_region_m = 120000.0f;  // X4MP_REGION_M: region radius (meters)
 // Convergence diagnostics (reset per sector entry, logged once under X4MP_DEBUG).
 static unsigned g_cv_host = 0, g_cv_bound = 0, g_cv_ghost = 0;
 static float g_cv_maxd = 0.0f;
@@ -204,6 +231,29 @@ static unsigned g_flk_bindrel = 0;   // binding released: local ship became inva
 static unsigned g_flk_death = 0;     // ghost died locally (respawned)
 static unsigned g_flk_spawn = 0;     // ghost spawned
 static unsigned g_flk_prune = 0;     // local ship pruned (not reported by host)
+// Phase 0/1 (tug-of-war): bound ships are re-inerted + pinned EVERY frame by
+// pin_bound_pass() so the client's own simulation has no window to move them
+// between pins. The drift counters below measure whether the local sim is still
+// contesting the host pin (the source of the position flicker).
+static unsigned g_flk_pinned = 0;     // bound-ship pins performed (per-frame path)
+static unsigned g_flk_drift_big = 0;  // pins where the local ship had drifted > g_drift_alert_m since last drawn
+static float g_flk_drift_max_m = 0.0f; // max such drift observed this logging window
+static float g_drift_alert_m = 5.0f;  // X4MP_DRIFT_ALERT_M: drift (m) that means "local sim moved it"
+static int g_pin_interval = 1;        // X4MP_PIN_INTERVAL: frames between bound-ship pins (1 = every frame)
+static std::chrono::steady_clock::time_point g_last_pin_time;
+static float g_drift_verbose_m = 1000.0f; // X4MP_DRIFT_VERBOSE_M: log full detail when drift exceeds this (m)
+static std::unordered_map<unsigned long long, std::chrono::steady_clock::time_point> g_drift_log_t;
+// Frame-alignment diagnostic (X4MP_FRAME_DIAG_S, default 5): the reconciliation
+// assumes the client's local universe and the host's streamed universe share ONE
+// coordinate frame, so a local ship can be pinned to the host's reported
+// position. If that is false (client actually in a different sector, or the two
+// instances use different origins), pins target positions ~100,000+ km away and
+// are rejected, leaving ships stuck in the wrong place. frame_diagnostic()
+// measures this directly: it compares the distance from the client's player to
+// its LOCAL ships (client frame, a control that must be small) against the
+// distance to the host's STREAMED ships (host frame). If local is near but
+// streamed is far, the frames are mismatched.
+static int g_frame_diag_interval_s = 5;
 
 // Host sector MACRO name -> client sector UniverseID. Built once on
 // universe_ready (the client loads the same save, so sector macros match).
@@ -344,15 +394,41 @@ static void rebuild_local_index(UniverseID sector) {
     // (includehidden aliases), which would fill the index with duplicates.
     std::unordered_set<UniverseID> indexed;
     uint32_t dupes = 0;
+    // Region streaming (opt-in): also index ships within g_region_m of the
+    // player (neighbouring sectors), so the host-streamed region ships bind to
+    // their local copies instead of spawning ghosts. The distance test is
+    // C-level (GetObjectPositionInSector) — cheap; the Lua get_macro only runs
+    // for the ships that pass. Positions share one continuous frame.
+    bool region = g_region && g_game->GetObjectPositionInSector &&
+                  g_game->GetPlayerObjectID;
+    UIPosRot player_pos{};
+    if (region) {
+        UniverseID pid = g_game->GetPlayerObjectID();
+        if (pid && g_game->IsValidComponent && g_game->IsValidComponent(pid))
+            player_pos = g_game->GetObjectPositionInSector(pid);
+    }
+    float region_r2 = g_region_m * g_region_m;
     for (uint32_t f = 0; f < nf; f++) {
         uint32_t ns = enum_faction_ships(factions[f], ships);
         for (uint32_t i = 0; i < ns; i++) {
             UniverseID s = ships[i];
             if (pids.contains(s)) continue;
             if (g_game->IsValidComponent && !g_game->IsValidComponent(s)) continue;
-            if (g_game->GetContextByClass(s, "sector", false) != sector) continue;
+            UniverseID s_sector = g_game->GetContextByClass(s, "sector", false);
+            bool in_sector = (s_sector == sector);
+            bool in_region = false;
+            if (!in_sector && region) {
+                UIPosRot sp = g_game->GetObjectPositionInSector(s);
+                float dx = sp.x - player_pos.x, dy = sp.y - player_pos.y, dz = sp.z - player_pos.z;
+                in_region = (dx*dx + dy*dy + dz*dz < region_r2);
+            }
+            if (!in_sector && !in_region) continue;
             char macro[160]; get_macro(s, macro, sizeof(macro));
             if (!macro[0] || macro[0] == '?') continue;
+            // Load-bearing player satellite: never index it (so it is neither
+            // suppressed nor pruned) — it must stay simulated to keep the
+            // client's sector active.
+            if (strstr(macro, "satellite")) continue;
             if (!indexed.insert(s).second) { dupes++; continue; }
             size_t idx = g_index_ships.size();
             g_index_ships.push_back(s);
@@ -365,7 +441,26 @@ static void rebuild_local_index(UniverseID sector) {
     // driven by the host pin. The player's own ships are already excluded from
     // the index. Re-done on every sector entry (the game may re-activate ships
     // when the sector becomes live again).
-    if (g_inert && g_game->ActivateObject) {
+    if (g_ghosts && g_game->RemoveComponent && g_game->IsValidComponent) {
+        // Option A: suppress the zone's diverged local ships entirely. With none
+        // left to bind, render_pass falls through to its ghost path and the host
+        // world is rendered purely as ghosts. RemoveComponent is silent (no
+        // combat-kill MD event) — the same mechanism the prune loop already uses.
+        // Player ships and the satellite were already excluded from the index.
+        unsigned removed = 0;
+        for (UniverseID s : g_index_ships) {
+            if (g_boarding_exempt.count(s)) continue;
+            if (!g_game->IsValidComponent(s)) continue;
+            g_game->RemoveComponent(s);
+            removed++;
+        }
+        if (g_api && g_api->log) {
+            char m[220];
+            snprintf(m, sizeof(m), "x4mp_stream: [GHOST] suppressed %u local ships in sector %llu (host world now rendered as ghosts)",
+                     removed, (unsigned long long)sector);
+            g_api->log(X4NATIVE_LOG_INFO, m);
+        }
+    } else if (g_inert && g_game->ActivateObject) {
         for (UniverseID s : g_index_ships) {
             if (g_boarding_exempt.count(s)) continue; // boarding in progress: keep simulated
             g_game->ActivateObject(s, false);
@@ -813,6 +908,21 @@ static void render_pass() {
     UniverseID client_sector = g_game->GetContextByClass(player_zone, "sector", false);
     if (!client_sector) return;
 
+    // Region streaming: the player's position (world frame) for the region
+    // radius test. Used to keep neighbouring-sector ships alive within R.
+    UIPosRot player_pos{};
+    if (g_region && g_game->GetPlayerObjectID) {
+        UniverseID pid = g_game->GetPlayerObjectID();
+        if (pid && g_game->IsValidComponent && g_game->IsValidComponent(pid))
+            player_pos = g_game->GetObjectPositionInSector(pid);
+    }
+    const float region_r2 = g_region_m * g_region_m;
+    auto within_region = [&](float x, float y, float z) {
+        if (!g_region) return true; // region disabled: every ship is "in region"
+        float dx = x - player_pos.x, dy = y - player_pos.y, dz = z - player_pos.z;
+        return (dx*dx + dy*dy + dz*dz) < region_r2;
+    };
+
     // Sector change: rebuild the local-ship index for the new rendering zone
     // (binding + correction operate only within the current sector) and wait
     // for a fresh FULL snapshot before any missing-ship pruning.
@@ -920,13 +1030,17 @@ static void render_pass() {
         net_log(dbg);
         // Flicker rate over the last ~15s (300 ticks). High numbers in any
         // column = that mechanism is churning ships (the flicker source).
-        static unsigned p_stale=0,p_zone=0,p_bindrel=0,p_death=0,p_spawn=0,p_prune=0;
-        char flk[256];
-        snprintf(flk, sizeof(flk), "x4mp_stream: [FLK] /15s: stale=%u zone=%u bindrel=%u death=%u spawn=%u prune=%u",
+        static unsigned p_stale=0,p_zone=0,p_bindrel=0,p_death=0,p_spawn=0,p_prune=0,p_pinned=0,p_drift=0;
+        char flk[320];
+        snprintf(flk, sizeof(flk), "x4mp_stream: [FLK] /15s: stale=%u zone=%u bindrel=%u death=%u spawn=%u prune=%u | pin=%u drift>%dm=%u maxdrift=%.0fm",
                  g_flk_stale-p_stale, g_flk_zone-p_zone, g_flk_bindrel-p_bindrel,
-                 g_flk_death-p_death, g_flk_spawn-p_spawn, g_flk_prune-p_prune);
+                 g_flk_death-p_death, g_flk_spawn-p_spawn, g_flk_prune-p_prune,
+                 g_flk_pinned-p_pinned, (int)g_drift_alert_m, g_flk_drift_big-p_drift,
+                 g_flk_drift_max_m);
         p_stale=g_flk_stale; p_zone=g_flk_zone; p_bindrel=g_flk_bindrel;
         p_death=g_flk_death; p_spawn=g_flk_spawn; p_prune=g_flk_prune;
+        p_pinned=g_flk_pinned; p_drift=g_flk_drift_big;
+        g_flk_drift_max_m = 0.0f;
         net_log(flk);
     }
     for (auto& kv : g_objs) {
@@ -963,7 +1077,7 @@ static void render_pass() {
         // is what removes the highway sector-entry teleport.
         float dt = std::chrono::duration_cast<std::chrono::duration<float>>(now - o.last_update).count();
         float ddx = o.tx - o.px, ddy = o.ty - o.py, ddz = o.tz - o.pz;
-        float dist = sqrtf(ddx*ddx + ddy*ddy + ddz*ddz);
+        float dist = fsq(ddx*ddx + ddy*ddy + ddz*ddz);
         float ix, iy, iz;
         if (o.gliding) {
             float maxstep = g_glide_speed * g_render_dt;
@@ -1011,7 +1125,8 @@ static void render_pass() {
         // PLAYER ghosts are kept (few of them) so they reappear when the
         // client flies into that sector.
         if (target_sector != client_sector) {
-            if (!o.is_player) {
+            if (!o.is_player && !(g_region && within_region(o.tx, o.ty, o.tz))) {
+                // Out of the current sector AND out of the region: drop.
                 // Release any binding first: dropping the RemoteObj without
                 // clearing g_bindings/g_bound_locals leaks the local ship into
                 // g_bound_locals forever, where the prune loop skips it — the
@@ -1029,8 +1144,12 @@ static void render_pass() {
                     g_game->RemoveComponent(o.client_id);
                 g_flk_zone++;
                 dead.push_back(kv.first);
+                continue;
             }
-            continue;
+            // Region ship (within R of the player) or player ghost: keep it and
+            // fall through to bind + pin. Binding it to its local copy (in the
+            // neighbouring sector) syncs that copy before the player arrives, so
+            // there is no diverged-save-position snap on sector entry.
         }
 
         // ---- Station ghosts (host-built, issue 3) -------------------------
@@ -1104,7 +1223,7 @@ static void render_pass() {
                     g_bindings[kv.first] = local;
                     g_bound_locals.insert(local);
                     g_missing_since.erase(local);
-                    if (greedy) { g_cv_bound++; g_cv_maxd = fmaxf(g_cv_maxd, sqrtf(best_d2)); }
+                    if (greedy) { g_cv_bound++; g_cv_maxd = fmaxf(g_cv_maxd, fsq(best_d2)); }
                     // Replace a previously spawned ghost of this host ship.
                     if (o.spawned && o.client_id && g_game->RemoveComponent)
                         g_game->RemoveComponent(o.client_id);
@@ -1125,7 +1244,7 @@ static void render_pass() {
                                 char dbg[160];
                                 snprintf(dbg, sizeof(dbg), "x4mp_stream: [DBG] GLIDE host=%llu local=%llu from (%.0f,%.0f,%.0f) -> (%.0f,%.0f,%.0f) dist=%.0fm",
                                          (unsigned long long)kv.first, (unsigned long long)local,
-                                         lp.x, lp.y, lp.z, o.tx, o.ty, o.tz, sqrtf(d2));
+                                         lp.x, lp.y, lp.z, o.tx, o.ty, o.tz, fsq(d2));
                                 net_log(dbg);
                             }
                             // No instant snap; the per-frame pinning glides it.
@@ -1134,7 +1253,7 @@ static void render_pass() {
                             o.gliding = false;
                             UIPosRot snap; snap.x = o.tx; snap.y = o.ty; snap.z = o.tz;
                             snap.yaw = o.tyaw; snap.pitch = o.tpitch; snap.roll = o.troll;
-                            g_game->SetObjectSectorPos(local, client_sector, snap);
+                            g_game->SetObjectSectorPos(local, target_sector, snap);
                         }
                     }
                     bound_now++;
@@ -1147,7 +1266,7 @@ static void render_pass() {
                 // (a drift threshold can't keep up at 15 km/s).
                 if (g_inert && g_game->ActivateObject && !g_boarding_exempt.count(local))
                     g_game->ActivateObject(local, false);
-                g_game->SetObjectSectorPos(local, client_sector, pos);
+                g_game->SetObjectSectorPos(local, target_sector, pos);
                 corrected++;
             }
             if (local) continue; // driven by the host; no ghost for this one
@@ -1305,7 +1424,206 @@ static void process_md_kills(); // fwd (defined below, near the MD callback)
 static void process_owner_changes(); // fwd (defined below)
 static void process_boarding_events(); // fwd (defined below)
 
+// Advance a remote object's interpolation origin toward its target and return
+// the position to draw this step. Shared by render_pass (unbound objects) and
+// pin_bound_pass (bound objects, every frame). Side effect: advances o.px/py/pz.
+static UIPosRot interpolate_obj(RemoteObj& o, float dt) {
+    float ddx = o.tx - o.px, ddy = o.ty - o.py, ddz = o.tz - o.pz;
+    float dist = fsq(ddx*ddx + ddy*ddy + ddz*ddz);
+    float ix, iy, iz;
+    if (o.gliding) {
+        float maxstep = g_glide_speed * g_render_dt;
+        if (dist <= maxstep + 200.0f) {
+            ix = o.tx; iy = o.ty; iz = o.tz;
+            o.px = o.tx; o.py = o.ty; o.pz = o.tz;
+            o.gliding = false;
+        } else {
+            float s = (maxstep > 0.0f) ? (maxstep / dist) : 1.0f;
+            ix = o.px + ddx * s; iy = o.py + ddy * s; iz = o.pz + ddz * s;
+            o.px = ix; o.py = iy; o.pz = iz;
+        }
+    } else {
+        float v_est = dist / fmaxf(dt, 0.001f);
+        float tau = g_smooth_tau > 0 ? g_smooth_tau : 0.12f;
+        if (v_est > 1.0f) {
+            float tau_fast = g_max_lag_m / v_est;
+            if (tau_fast < tau) tau = tau_fast;
+        }
+        float alpha = 1.0f - expf(-dt / fmaxf(tau, 0.005f));
+        if (alpha > 1.0f) alpha = 1.0f;
+        ix = o.px + (o.tx - o.px) * alpha;
+        iy = o.py + (o.ty - o.py) * alpha;
+        iz = o.pz + (o.tz - o.pz) * alpha;
+    }
+    UIPosRot pos; pos.x = ix; pos.y = iy; pos.z = iz;
+    pos.yaw = o.tyaw; pos.pitch = o.tpitch; pos.roll = o.troll;
+    return pos;
+}
+
+// Phase 1: re-inert + pin every ALREADY-BOUND ship to its interpolated host
+// position, once per frame. This closes the window in which the client's own
+// game simulation (which X4 re-activates for live-zone ships) could move a bound
+// ship between the every-3rd-frame render_pass pins — the source of the
+// back-and-forth position flicker. Purely additive: render_pass still owns
+// lifecycle (bind-search, spawn, prune, zone-drop); it merely no longer needs to
+// be the only thing pinning.
+static void pin_bound_pass() {
+    if (!g_game || !g_ready) return;
+    if (!g_game->SetObjectSectorPos || !g_game->IsValidComponent) return;
+    if (g_index_sector == 0) return;
+    UniverseID client_sector = g_index_sector;
+
+    auto now = std::chrono::steady_clock::now();
+    // Keep the glide step-size (g_render_dt) tracking the real frame interval so
+    // a convergence glide advances smoothly at g_glide_speed every frame.
+    if (g_last_pin_time.time_since_epoch().count() > 0) {
+        float fdt = std::chrono::duration_cast<std::chrono::duration<float>>(now - g_last_pin_time).count();
+        if (fdt > 0.0f && fdt < 0.5f) g_render_dt = fdt;
+    }
+    g_last_pin_time = now;
+
+    if (g_drift_log_t.size() > 20000) g_drift_log_t.clear();
+
+    std::lock_guard<std::mutex> lk(g_mutex);
+    for (auto& kv : g_objs) {
+        RemoteObj& o = kv.second;
+        if (!o.has_target || o.is_player || o.is_station) continue;
+        auto bit = g_bindings.find(kv.first);
+        if (bit == g_bindings.end()) continue;
+        UniverseID local = bit->second;
+        if (!g_game->IsValidComponent(local)) continue; // render_pass will unbind
+
+        // Phase 0 diagnostic: how far did the local sim drag this ship from the
+        // last position we drew it at? Beyond g_drift_alert_m means the local
+        // simulation is contesting the host pin (the tug-of-war).
+        if (g_debug && g_game->GetObjectPositionInSector) {
+            UIPosRot cur = g_game->GetObjectPositionInSector(local);
+            float dx = cur.x - o.px, dy = cur.y - o.py, dz = cur.z - o.pz;
+            float d = fsq(dx*dx + dy*dy + dz*dz);
+            if (d > g_drift_alert_m) {
+                g_flk_drift_big++;
+                if (d > g_flk_drift_max_m) g_flk_drift_max_m = d;
+                // Phase 0 verbose: capture the worst offenders with full context.
+                // Tells us whether a big drift is (a) a correct binding whose
+                // local sim outruns the pin, (b) a wrong-macro/wrong-sector
+                // binding, or (c) a SetObjectSectorPos that is not sticking.
+                if (d > g_drift_verbose_m) {
+                    auto lt = g_drift_log_t.find(kv.first);
+                    if (lt == g_drift_log_t.end() ||
+                        now - lt->second > std::chrono::milliseconds(2000)) {
+                        g_drift_log_t[kv.first] = now;
+                        char dv[360];
+                        snprintf(dv, sizeof(dv),
+                            "x4mp_stream: [FLKV] host=%llu local=%llu macro=%s drift=%.0fm cur=(%.0f,%.0f,%.0f) px=(%.0f,%.0f,%.0f) tx=(%.0f,%.0f,%.0f) tsect=%s csect=%llu glide=%d exempt=%d",
+                            (unsigned long long)kv.first, (unsigned long long)local, o.macro, d,
+                            cur.x, cur.y, cur.z, o.px, o.py, o.pz, o.tx, o.ty, o.tz,
+                            o.sector_macro, (unsigned long long)client_sector,
+                            (int)o.gliding, (int)g_boarding_exempt.count(local));
+                        net_log(dv);
+                    }
+                }
+            }
+        }
+
+        float dt = std::chrono::duration_cast<std::chrono::duration<float>>(now - o.last_update).count();
+        UIPosRot pos = interpolate_obj(o, dt);
+
+        UniverseID target_sector = client_sector;
+        if (o.sector_macro[0]) {
+            auto it = g_sector_map.find(o.sector_macro);
+            if (it != g_sector_map.end()) target_sector = it->second;
+        }
+        if (g_inert && g_game->ActivateObject && !g_boarding_exempt.count(local))
+            g_game->ActivateObject(local, false);
+        g_game->SetObjectSectorPos(local, target_sector, pos);
+        g_flk_pinned++;
+    }
+}
+
+// Frame-alignment diagnostic. Logs every g_frame_diag_interval_s seconds:
+//   [FRM] sector=.. player=(..) local_mind=.. streamed_mind=..  <-- FRAME MISMATCH
+// local_mind  = min distance player->LOCAL ship in the current sector (client frame).
+//               This is the CONTROL: the player's own sector ships surround it, so
+//               it should always be small (a few km) regardless of any frame issue.
+// streamed_mind = min distance player->host STREAMED ship target (host frame).
+//               The streamed ships ARE the same sector's population, so if the
+//               frames align this is also small. If it is huge while local_mind is
+//               small, the host's positions are in a different frame / the client
+//               is actually in a different sector than it reports.
+static void frame_diagnostic() {
+    static auto last = std::chrono::steady_clock::now() - std::chrono::hours(1);
+    auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::seconds>(now - last).count() < g_frame_diag_interval_s)
+        return;
+    last = now;
+    if (!g_ready) return;
+    if (!g_game || !g_game->GetContextByClass || !g_game->GetPlayerObjectID ||
+        !g_game->GetObjectPositionInSector || !g_game->IsValidComponent) return;
+    UniverseID pid = g_game->GetPlayerObjectID();
+    if (!pid || !g_game->IsValidComponent(pid)) return;
+    UIPosRot player = g_game->GetObjectPositionInSector(pid);
+    UniverseID pz = g_game->GetPlayerZoneID ? g_game->GetPlayerZoneID() : 0;
+    UniverseID cur_sector = (pz && g_game->GetContextByClass)
+        ? g_game->GetContextByClass(pz, "sector", false) : 0;
+    char sect[160] = {0};
+    if (cur_sector) get_macro(cur_sector, sect, sizeof(sect));
+
+    // CONTROL: nearest LOCAL ship in the current sector (client frame).
+    float local_min = 1e30f; unsigned local_n = 0;
+    if (g_index_sector == cur_sector) {
+        for (UniverseID s : g_index_ships) {
+            if (!g_game->IsValidComponent(s)) continue;
+            UIPosRot p = g_game->GetObjectPositionInSector(s);
+            float dx = p.x - player.x, dy = p.y - player.y, dz = p.z - player.z;
+            float d = fsq(dx*dx + dy*dy + dz*dz);
+            if (d < local_min) local_min = d;
+            local_n++;
+        }
+    }
+
+    // TEST: nearest STREAMED ship (host frame). Also capture its id, target (tx)
+    // and interpolation origin (px) so we can tell, sample-to-sample, whether the
+    // ghost is (a) jumping because the host sends unstable tx, (b) lagging because
+    // px is still chasing tx, or (c) stable.
+    float stream_min = 1e30f; unsigned stream_n = 0;
+    unsigned long long near_id = 0;
+    float near_tx[3] = {0,0,0}, near_px[3] = {0,0,0}; float near_pxt = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        for (auto& kv : g_objs) {
+            RemoteObj& o = kv.second;
+            if (!o.has_target || o.is_station) continue;
+            float dx = o.tx - player.x, dy = o.ty - player.y, dz = o.tz - player.z;
+            float d = fsq(dx*dx + dy*dy + dz*dz);
+            if (d < stream_min) {
+                stream_min = d; near_id = kv.first;
+                near_tx[0]=o.tx; near_tx[1]=o.ty; near_tx[2]=o.tz;
+                near_px[0]=o.px; near_px[1]=o.py; near_px[2]=o.pz;
+                float ex=o.tx-o.px, ey=o.ty-o.py, ez=o.tz-o.pz;
+                near_pxt = fsq(ex*ex+ey*ey+ez*ez);
+            }
+            stream_n++;
+        }
+    }
+
+    if (stream_n == 0) return; // no streamed data -> not a reconciling client
+    bool mismatch = local_n && stream_n && local_min < 25000.0f && stream_min > 25000.0f;
+    char buf[640];
+    snprintf(buf, sizeof(buf),
+        "[FRM] sector=%s player=(%d,%d,%d) local_mind=%dm (n=%u) streamed_mind=%dm (n=%u) near=id%llu tx=(%d,%d,%d) px=(%d,%d,%d) pxt=%.0fm%s",
+        sect[0] ? sect : "?", (int)player.x, (int)player.y, (int)player.z,
+        local_n ? (int)local_min : -1, local_n,
+        stream_n ? (int)stream_min : -1, stream_n,
+        near_id, (int)near_tx[0], (int)near_tx[1], (int)near_tx[2],
+        (int)near_px[0], (int)near_px[1], (int)near_px[2], near_pxt,
+        mismatch ? "  <-- FRAME MISMATCH" : "");
+    if (g_api && g_api->log) g_api->log(X4NATIVE_LOG_INFO, buf);
+}
+
 static void on_frame_update(const char* /*name*/, void* /*data*/, void* /*ud*/) {
+    // Frame-alignment diagnostic (self-throttled by time). Skips itself when
+    // there is no streamed data, so it is a no-op on the host.
+    frame_diagnostic();
     autofly_tick();
     // Trading: poll the player ship's cargo and report changes to the host.
     maybe_send_cargo();
@@ -1322,6 +1640,13 @@ static void on_frame_update(const char* /*name*/, void* /*data*/, void* /*ud*/) 
         { std::lock_guard<std::mutex> lk(g_mutex); acts = std::move(g_pending_acts); g_pending_acts.clear(); }
         for (auto& a : acts) g_api->raise_event("x4mp.send_act", (void*)a.c_str());
     }
+    // Phase 1: pin + re-inert already-bound ships every frame (or every
+    // X4MP_PIN_INTERVAL frames) so the local simulation can't move them between
+    // pins. Independent of the full render_pass throttle below.
+    static unsigned pintick = 0;
+    if ((++pintick % (unsigned)(g_pin_interval > 0 ? g_pin_interval : 1)) == 0)
+        pin_bound_pass();
+
     static unsigned tick = 0;
     if ((++tick % (unsigned)(g_render_interval > 0 ? g_render_interval : 3)) != 0) return;
     render_pass();
@@ -1521,6 +1846,18 @@ X4NATIVE_EXPORT int x4native_init(X4NativeAPI* api) {
     if (ln) g_legacy_net = (*ln != '0');   // default OFF (consolidated); X4MP_LEGACY_NET=1 -> legacy own-socket mode
     const char* ri = std::getenv("X4MP_RENDER_INTERVAL");
     if (ri) { int v = atoi(ri); if (v >= 1 && v <= 60) g_render_interval = v; }
+    // Phase 1: how often to re-inert + pin already-bound ships (1 = every frame).
+    const char* pi = std::getenv("X4MP_PIN_INTERVAL");
+    if (pi) { int v = atoi(pi); if (v >= 1 && v <= 60) g_pin_interval = v; }
+    // Phase 0: drift threshold (m) above which a pin counts as "local sim contested".
+    const char* da = std::getenv("X4MP_DRIFT_ALERT_M");
+    if (da) { float v = (float)atof(da); if (v > 0.0f && v < 1000.0f) g_drift_alert_m = v; }
+    // Phase 0: drift (m) above which the full [FLKV] verbose diagnostic is logged.
+    const char* dv = std::getenv("X4MP_DRIFT_VERBOSE_M");
+    if (dv) { float v = (float)atof(dv); if (v >= 10.0f && v < 1000000.0f) g_drift_verbose_m = v; }
+    // Frame-alignment diagnostic interval (seconds).
+    const char* fd = std::getenv("X4MP_FRAME_DIAG_S");
+    if (fd) { int v = atoi(fd); if (v >= 1 && v <= 3600) g_frame_diag_interval_s = v; }
     const char* tau = std::getenv("X4MP_SMOOTH_TAU");
     if (tau) { float v = (float)atof(tau); if (v >= 0.001f && v <= 2.0f) g_smooth_tau = v; }
     const char* ml = std::getenv("X4MP_MAX_LAG_M");
@@ -1533,12 +1870,18 @@ X4NATIVE_EXPORT int x4native_init(X4NativeAPI* api) {
     if (dbg && *dbg == '1') g_debug = true;
     const char* in = std::getenv("X4MP_INERT");
     if (in) g_inert = (*in != '0');            // default ON; X4MP_INERT=0 disables
+    const char* gh = std::getenv("X4MP_GHOSTS");
+    if (gh) g_ghosts = (atoi(gh) != 0);        // X4MP_GHOSTS=1: Option A ghost rendering
     const char* cg = std::getenv("X4MP_CONVERGE_GREEDY");
     if (cg) g_converge_greedy = (*cg != '0');  // default ON; X4MP_CONVERGE_GREEDY=0 disables
     const char* gs = std::getenv("X4MP_GLIDE_SPEED");
     if (gs) { float v = (float)atof(gs); if (v >= 50.0f && v <= 20000.0f) g_glide_speed = v; }
     const char* gm = std::getenv("X4MP_GLIDE_MAX");
     if (gm) { float v = (float)atof(gm); if (v >= 1000.0f && v <= 500000.0f) g_glide_max_m = v; }
+    const char* reg = std::getenv("X4MP_REGION");
+    if (reg && *reg == '1') g_region = true;
+    const char* rm = std::getenv("X4MP_REGION_M");
+    if (rm) { float v = (float)atof(rm); if (v >= 10000.0f && v <= 1000000.0f) g_region_m = v; }
     const char* af = std::getenv("X4MP_AUTOFLY");
     if (af && *af == '1') g_autofly = true;
     const char* afi = std::getenv("X4MP_AUTOFLY_INTERVAL");

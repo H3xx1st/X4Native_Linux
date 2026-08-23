@@ -756,6 +756,21 @@ static float  g_delta_m = 0.5f;        // min movement (meters) to re-send an ob
 static float  g_relevance_m = 20000.0f; // only stream objects within this radius of the host player
 static int    g_full_refresh_interval = 120; // frames between forced full refreshes
 
+// ---- Region streaming (opt-in, X4MP_REGION=1) --------------------------------
+// Fixes the highway flicker: instead of streaming ONLY the client's current
+// sector (so ships in the next sector sit diverged at save positions and snap
+// on entry), also stream ships within g_region_m of the client's position.
+// The universe shares one continuous coordinate frame (galactic plane at y=0),
+// so a distance query across sectors is valid. The region index is computed
+// during the periodic refresh (net_maintain_universe) and streamed every tick.
+// When g_region is false the existing current-sector-only path is untouched.
+static bool   g_region = false;        // X4MP_REGION=1 enables region streaming
+static float  g_region_m = 120000.0f;  // X4MP_REGION_M: region radius (meters)
+// Per-client region ships (client IP+port key -> ZoneObj* within R of the
+// client, EXCLUDING the client's current sector which is streamed separately).
+// Rebuilt during the refresh; the ZoneObj* stay valid until the next refresh.
+static std::unordered_map<uint64_t, std::vector<ZoneObj*>> g_client_region;
+
 // Multi-stream networking: port 7777 is the control/handshake channel; ports
 // 7778+ are data channels, each streamed by its own thread.
 static std::mutex g_data_mutex;                 // protects g_client_objs, g_snap
@@ -834,6 +849,16 @@ static void get_macro(UniverseID id, char* out, size_t outsize) {
         const char* n = g_game->GetComponentName(id);
         if (n) snprintf(out, outsize, "%s", n);
     }
+}
+
+// Return the object's sector (0 if it has none). IsValidComponent alone is NOT a
+// safe guard for GetObjectPositionInSector: an object mid-destroy, docked, or
+// between sectors is still valid but has no sector, and reading its position
+// makes the engine log "Failed to retrieve sector of object <id>" every tick
+// (log flood). Callers check this before reading a position.
+static inline UniverseID sector_of(UniverseID obj) {
+    return (g_game && g_game->GetContextByClass)
+        ? g_game->GetContextByClass(obj, "sector", false) : 0;
 }
 
 // HOST: a data-streaming thread. Binds a data socket (port 7777+1+i), accepts
@@ -1096,10 +1121,42 @@ static void net_maintain_universe() {
     g_sector_ship_index.clear();
     for (auto& zo : g_zone_objs) g_sector_ship_index[zo.sector].push_back(&zo);
     g_last_index_rebuild = std::chrono::steady_clock::now();
+
+    // Region streaming (opt-in): build the per-client region index. For each
+    // connected client, collect the ships within g_region_m of the client's
+    // position that are NOT in the client's current sector (those are streamed
+    // by the normal current-sector path). Positions share one continuous frame
+    // (galactic plane at y=0), so the cross-sector distance is valid. Each ship
+    // position is read once into pos_cache (avoids 85k x N Lua calls).
+    g_client_region.clear();
+    if (g_region && !g_clients.empty()) {
+        std::vector<UIPosRot> pos_cache;
+        pos_cache.reserve(g_zone_objs.size());
+        for (auto& zo : g_zone_objs) {
+            // Keep pos_cache index-aligned with g_zone_objs; a sectorless object
+            // gets a zero position (harmless — it will never be near any client).
+            if (!sector_of(zo.id)) { pos_cache.push_back(UIPosRot{}); continue; }
+            pos_cache.push_back(g_game->GetObjectPositionInSector(zo.id));
+        }
+        float r2 = g_region_m * g_region_m;
+        for (auto& c : g_clients) {
+            if (!c.cur_sector) continue;
+            uint64_t key = ((uint64_t)c.addr.sin_addr.s_addr << 16) | (uint32_t)ntohs(c.addr.sin_port);
+            auto sit = g_client_ship_state.find(key);
+            if (sit == g_client_ship_state.end()) continue;
+            float px = sit->second.x, py = sit->second.y, pz = sit->second.z;
+            std::vector<ZoneObj*>& reg = g_client_region[key];
+            for (size_t i = 0; i < g_zone_objs.size(); i++) {
+                if (g_zone_objs[i].sector == c.cur_sector) continue; // streamed separately
+                float dx = pos_cache[i].x - px, dy = pos_cache[i].y - py, dz = pos_cache[i].z - pz;
+                if (dx*dx + dy*dy + dz*dz < r2) reg.push_back(&g_zone_objs[i]);
+            }
+        }
+    }
     if (g_debug) {
         char dbg[220];
-        snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST refreshed ALL ships: %u (highsim sectors: %zu, streamed: %zu)",
-                 total_ships, g_highsim_sectors.size(), g_zone_objs.size());
+        snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST refreshed ALL ships: %u (highsim sectors: %zu, streamed: %zu, region clients: %zu)",
+                 total_ships, g_highsim_sectors.size(), g_zone_objs.size(), g_client_region.size());
         net_debug(dbg);
     }
 }
@@ -1158,14 +1215,27 @@ static void net_send_obj_batch_to(NetClient* c, const char* batch, size_t len) {
 // beyond g_delta_m are re-sent (per-client delta state).
 static void net_send_client_objects(NetClient& c) {
     if (!c.cur_sector) return;
+    bool index_current = (g_last_index_rebuild >= c.cur_sector_set_time);
+
+    // Region ships (opt-in X4MP_REGION): ships within g_region_m of the client
+    // that are NOT in the current sector (those come from the per-sector index
+    // below). Streaming them keeps the neighbouring sectors' ships pre-synced,
+    // so a sector transition has no diverged-save-position snap/glide.
+    const std::vector<ZoneObj*>* region = nullptr;
+    if (g_region) {
+        uint64_t key = ((uint64_t)c.addr.sin_addr.s_addr << 16) | (uint32_t)ntohs(c.addr.sin_port);
+        auto rit = g_client_region.find(key);
+        if (rit != g_client_region.end() && !rit->second.empty()) region = &rit->second;
+    }
+
     auto sit = g_sector_ship_index.find(c.cur_sector);
-    if (sit == g_sector_ship_index.end() || sit->second.empty()) {
-        // No streamable ships in this sector: still send an (empty) FULL
-        // snapshot so the client can prune local ships that died on the host.
-        // But ONLY once the index has been rebuilt since this client's sector
-        // changed — a not-yet-indexed sector looks empty and would otherwise
-        // make the client prune its entire local sector.
-        bool index_current = (g_last_index_rebuild >= c.cur_sector_set_time);
+    bool has_sector = (sit != g_sector_ship_index.end() && !sit->second.empty());
+    if (!has_sector && !region) {
+        // No streamable ships in this sector or region: still send an (empty)
+        // FULL snapshot so the client can prune local ships that died on the
+        // host. But ONLY once the index has been rebuilt since this client's
+        // sector changed — a not-yet-indexed sector looks empty and would
+        // otherwise make the client prune its entire local sector.
         if (c.needs_full && !g_zone_objs.empty() && index_current) {
             c.needs_full = false;
             net_send_obj_batch_to(&c, "FULL 1\n", 7);
@@ -1175,15 +1245,16 @@ static void net_send_client_objects(NetClient& c) {
 
     char batch[60000];
     size_t used = 0;
-    // Always send the COMPLETE sector state every tick. LAN bandwidth is cheap,
+    // Always send the COMPLETE region state every tick. LAN bandwidth is cheap,
     // and a full authoritative snapshot every tick keeps the client's view
     // exact — no delta-compression staleness to cause prune/respawn flicker.
-    const char* full = "FULL 1\n";
-    memcpy(batch, full, 6);
+    memcpy(batch, "FULL 1\n", 6);
     used = 6;
-    for (ZoneObj* zo : sit->second) {
+    // Append one OBJ line (handles the batch flush).
+    auto append = [&](ZoneObj* zo) {
         UniverseID obj = (UniverseID)zo->id;
-        if (g_game->IsValidComponent && !g_game->IsValidComponent(obj)) continue;
+        if (g_game->IsValidComponent && !g_game->IsValidComponent(obj)) return;
+        if (!sector_of(obj)) return; // lost its sector (dying/docked) -> skip, avoid log flood
         UIPosRot pos = g_game->GetObjectPositionInSector(obj);
         char buf[200];
         int n = snprintf(buf, sizeof(buf),
@@ -1197,7 +1268,9 @@ static void net_send_client_objects(NetClient& c) {
         }
         memcpy(batch + used, buf, (size_t)n);
         used += (size_t)n;
-    }
+    };
+    if (has_sector) for (ZoneObj* zo : sit->second) append(zo);
+    if (region) for (ZoneObj* zo : *region) append(zo);
     if (used > 0) net_send_obj_batch_to(&c, batch, used);
     c.needs_full = false; // complete state sent this tick; reset the flag
 }
@@ -1221,6 +1294,7 @@ static void net_send_objects_host() {
         // Skip objects that no longer exist (destroyed). IsValidComponent avoids
         // the engine's "Failed to retrieve" warnings for dead IDs.
         if (g_game->IsValidComponent && !g_game->IsValidComponent(obj)) continue;
+        if (!sector_of(obj)) continue; // lost its sector (dying/docked) -> skip, avoid log flood
         UIPosRot pos = g_game->GetObjectPositionInSector(obj);
         // Delta check: skip if not moved enough and not a forced full refresh.
         if (!force_full && zo.sent) {
@@ -1273,6 +1347,7 @@ static void net_send_objects_host_full() {
             total_seen++;
             UniverseID zone = g_game->GetContextByClass ? g_game->GetContextByClass(obj, "zone", false) : 0;
             if (zone != player_zone) continue;
+            if (!sector_of(obj)) continue;
             UIPosRot pos = g_game->GetObjectPositionInSector(obj);
             UniverseID sector = g_game->GetContextByClass ? g_game->GetContextByClass(obj, "sector", false) : 0;
             char macro[160]; get_macro(obj, macro, sizeof(macro));
@@ -1293,6 +1368,7 @@ static void net_send_objects_host_full() {
                 total_seen++;
                 UniverseID zone = g_game->GetContextByClass ? g_game->GetContextByClass(obj, "zone", false) : 0;
                 if (zone != player_zone) continue;
+                if (!sector_of(obj)) continue;
                 UIPosRot pos = g_game->GetObjectPositionInSector(obj);
                 UniverseID sector = g_game->GetContextByClass ? g_game->GetContextByClass(obj, "sector", false) : 0;
                 char macro[160]; get_macro(obj, macro, sizeof(macro));
@@ -1504,6 +1580,7 @@ static UniverseID find_station_by_trade(unsigned long long uid, float x, float y
         for (uint32_t i = 0; i < ns; i++) {
             UniverseID s = stns[i];
             if (g_game->IsValidComponent && !g_game->IsValidComponent(s)) continue;
+            if (!sector_of(s)) continue;
             UIPosRot p = g_game->GetObjectPositionInSector(s);
             float dx = p.x - x, dy = p.y - y, dz = p.z - z;
             float d2 = dx*dx + dy*dy + dz*dz;
@@ -2090,7 +2167,16 @@ static void net_poll() {
             // Consolidated UDP mode: data lines (OBJ/PLAYER) go to x4mp_stream
             // (reconciliation); control lines (WELCOME/PING) to process_message.
             // Legacy: every line goes to process_message (data arrives on 7778).
-            if (!g_legacy_net && g_transport == "udp" &&
+            //
+            // CLIENT ONLY: x4mp_stream reconciliation renders the HOST's world
+            // on the client. On the host this recv path receives the CLIENT's
+            // own PLAYER/ACT lines; those must go to process_message (which
+            // spawns the client ghost with the correct cfaction). Forwarding
+            // them to x4mp_stream mis-parses the client's cid-less PLAYER into
+            // a garbage obj whose faction is the client's sector macro, and
+            // x4mp_stream then tries to SpawnObjectAtPos2 that sector macro
+            // every frame (log flood + phantom spawn failures).
+            if (g_net_client && !g_legacy_net && g_transport == "udp" &&
                 (strncmp(line, "OBJ", 3) == 0 || strncmp(line, "PLAYER", 6) == 0 ||
                  strncmp(line, "FULL", 4) == 0 || strncmp(line, "STA", 3) == 0 ||
                  strncmp(line, "KILL", 4) == 0 || strncmp(line, "PLAYERDIED", 10) == 0 ||
@@ -2208,7 +2294,8 @@ static void net_update() {
                     char macro[160], smacro[160] = {0};
                     get_macro(s, macro, sizeof(macro));
                     UniverseID sec = g_game->GetContextByClass ? g_game->GetContextByClass(s, "sector", false) : 0;
-                    if (sec) get_macro(sec, smacro, sizeof(smacro));
+                    if (!sec) continue; // lost its sector (dying/docked) -> skip, avoid log flood
+                    get_macro(sec, smacro, sizeof(smacro));
                     UIPosRot pos = g_game->GetObjectPositionInSector(s);
                     char b[420];
                     snprintf(b, sizeof(b), "STA %llu %s %.3f %.3f %.3f %.3f %.3f %.3f player %s\n",
@@ -2371,9 +2458,10 @@ static void net_update() {
                         if (first) g_client_station_seq_map[s] = seq;
                         char macro[160], csector[160] = {0};
                         get_macro(s, macro, sizeof(macro));
-                        UIPosRot pos = g_game->GetObjectPositionInSector(s);
                         UniverseID sec = g_game->GetContextByClass ? g_game->GetContextByClass(s, "sector", false) : 0;
-                        if (sec) get_macro(sec, csector, sizeof(csector));
+                        if (!sec) continue; // lost its sector (dying/docked) -> skip, avoid log flood
+                        UIPosRot pos = g_game->GetObjectPositionInSector(s);
+                        get_macro(sec, csector, sizeof(csector));
                         char b[420];
                         snprintf(b, sizeof(b), "ACT BUILD %u %s %.3f %.3f %.3f %.3f %.3f %.3f %s\n",
                                  seq, macro[0] ? macro : "?", pos.x, pos.y, pos.z,
@@ -2434,6 +2522,10 @@ static void read_config() {
     if (ln) g_legacy_net = (*ln != '0');   // default OFF (consolidated); X4MP_LEGACY_NET=1 restores the legacy split-port mode
     const char* rel = std::getenv("X4MP_RELEVANCE_M");
     if (rel) { float v = (float)atof(rel); if (v >= 1000.0f && v <= 1000000.0f) g_relevance_m = v; }
+    const char* reg = std::getenv("X4MP_REGION");
+    if (reg && *reg == '1') g_region = true;
+    const char* rm = std::getenv("X4MP_REGION_M");
+    if (rm) { float v = (float)atof(rm); if (v >= 10000.0f && v <= 1000000.0f) g_region_m = v; }
     const char* dbg = std::getenv("X4MP_DEBUG");
     if (dbg && *dbg == '1') g_debug = true;
     const char* om = std::getenv("X4MP_OBJMODE");
