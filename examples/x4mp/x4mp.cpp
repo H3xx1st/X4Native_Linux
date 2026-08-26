@@ -70,6 +70,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <cerrno>
 #include <dirent.h>
 #include <unordered_map>
@@ -146,6 +147,12 @@ static std::chrono::steady_clock::time_point g_start;
 // -------------------------------------------------------------------------
 static int             g_sock = -1;
 static bool            g_net_host = false;
+// Client identity (persistence): a stable key + name, carried in JOIN so the
+// host recognises a reconnecting client across sessions. Loaded from
+// X4MP_CLIENT_KEY / X4MP_CLIENT_NAME (set by the launcher, which generates and
+// persists the key file; the host also keeps a backup of each client's key).
+static std::string g_client_key;
+static std::string g_client_name;
 static bool            g_net_client = false;
 static bool            g_net_connected = false; // client: handshake done
 static bool            g_stream_reported = false; // client: told host our stream port
@@ -177,6 +184,8 @@ struct NetClient {
     bool loading = false; // client is loading its save (don't prune during load)
     uint16_t stream_port = 7778; // client's dedicated stream port (x4mp_stream)
     char faction[80] = {0};      // unique player faction assigned by the host
+    char client_key[80] = {0};   // persistent client identity key (from JOIN)
+    char client_name[80] = {0};  // client display name (from JOIN)
     // Per-client sync-stream state (zone-limited OBJ stream):
     UniverseID cur_sector = 0;  // this client's current sector (host ids)
     bool needs_full = true;     // send a full sector snapshot on the next stream
@@ -236,6 +245,95 @@ static std::unordered_map<uint64_t, ClientShipState> g_client_ship_state;
 // Client-side ghosts of OTHER clients' ships (so clients see each other).
 // Key = remote client id (as sent by the host relay); value = spawned ship id.
 static std::unordered_map<unsigned long long, UniverseID> g_remote_ships;
+
+// ---- Client persistence (host-side) ---------------------------------------
+// Each client has a stable identity key (sent in JOIN). Its built assets are
+// recorded in a host-side state file so they survive sessions without relying
+// on the game save (no save pollution). Line-based format (no JSON dependency):
+//   client  <key> <name> <faction>
+//   station <key> <macro> <x> <y> <z> <yaw> <pitch> <roll> <sector_macro>
+struct PersistentStation { char macro[160]={0}; char sector[160]={0}; float x=0,y=0,z=0,yaw=0,pitch=0,roll=0; };
+struct ClientRecord     { char name[80]={0};  char faction[80]={0}; std::vector<PersistentStation> stations; };
+static std::unordered_map<std::string, ClientRecord> g_client_state;       // keyed by client key
+static std::unordered_set<UniverseID> g_persistent_station_objs;           // created from state: survive disconnect
+static std::unordered_set<std::string> g_restored_sigs;                    // station signatures already placed (no dup)
+static std::string g_state_path;
+static bool g_state_restored = false; // host: recorded stations re-created after universe ready
+static std::string station_sig(const std::string& key, const char* macro, float x, float y, float z, const char* sector) {
+    char b[160]; snprintf(b, sizeof(b), "%.0f|%.0f|%.0f|%s|%s", x, y, z, macro, sector);
+    return key + "|" + b;
+}
+
+// Set g_state_path to <HOME>/.config/x4mp/clientstate.txt, creating the dir.
+static void ensure_state_dir() {
+    if (!g_state_path.empty()) return;
+    const char* home = getenv("HOME");
+    if (!home) return;
+    char cfg[512];
+    snprintf(cfg, sizeof(cfg), "%s/.config", home);
+    mkdir(cfg, 0755); // ok if exists
+    snprintf(cfg, sizeof(cfg), "%s/.config/x4mp", home);
+    mkdir(cfg, 0755);
+    g_state_path = std::string(cfg) + "/clientstate.txt";
+}
+
+static void save_client_state() {
+    ensure_state_dir();
+    if (g_state_path.empty()) return;
+    FILE* f = fopen(g_state_path.c_str(), "w");
+    if (!f) return;
+    fputs("# x4mp client state (host-side persistence)\n", f);
+    for (auto& kv : g_client_state) {
+        fprintf(f, "client %s %s %s\n", kv.first.c_str(), kv.second.name, kv.second.faction);
+        for (auto& st : kv.second.stations)
+            fprintf(f, "station %s %s %.3f %.3f %.3f %.3f %.3f %.3f %s\n",
+                    kv.first.c_str(), st.macro, st.x, st.y, st.z, st.yaw, st.pitch, st.roll, st.sector);
+    }
+    fclose(f);
+}
+static void load_client_state() {
+    ensure_state_dir();
+    if (g_state_path.empty()) return;
+    FILE* f = fopen(g_state_path.c_str(), "r");
+    if (!f) return;
+    char line[700];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        char key[90];
+        if (sscanf(line, "client %89s", key) >= 1) {
+            char name[80]={0}, faction[80]={0};
+            sscanf(line, "client %89s %79s %79s", key, name, faction);
+            ClientRecord& r = g_client_state[key];
+            snprintf(r.name, sizeof(r.name), "%s", name);
+            snprintf(r.faction, sizeof(r.faction), "%s", faction);
+        } else if (strncmp(line, "station", 7) == 0) {
+            char key[90], macro[160], sector[160];
+            float x,y,z,yaw,pitch,roll;
+            if (sscanf(line, "station %89s %159s %f %f %f %f %f %f %159s",
+                       key, macro, &x, &y, &z, &yaw, &pitch, &roll, sector) >= 8) {
+                ClientRecord& r = g_client_state[key];
+                PersistentStation st;
+                snprintf(st.macro, sizeof(st.macro), "%s", macro);
+                snprintf(st.sector, sizeof(st.sector), "%s", sector);
+                st.x=x; st.y=y; st.z=z; st.yaw=yaw; st.pitch=pitch; st.roll=roll;
+                r.stations.push_back(st);
+            }
+        }
+    }
+    fclose(f);
+}
+static const std::string* pick_ghost_faction(int id); // fwd (defined below)
+// Stable faction for a client key (recorded on first use, reused after).
+static void key_faction(const std::string& key, char* out, size_t n) {
+    ClientRecord& r = g_client_state[key];
+    if (r.faction[0]) { snprintf(out, n, "%s", r.faction); return; }
+    // Deterministic id from the key (FNV-1a) so the same key always maps to the
+    // same faction, regardless of the (monotonic, per-connection) client id.
+    uint32_t h = 2166136261u;
+    for (unsigned char ch : key) { h ^= ch; h *= 16777619u; }
+    const std::string* f = pick_ghost_faction((int)(h % 1000000));
+    if (f) { snprintf(out, n, "%s", f->c_str()); snprintf(r.faction, n, "%s", f->c_str()); }
+}
 static unsigned        g_net_tick = 0;
 
 // Connection-stability timeouts (ms).
@@ -959,8 +1057,8 @@ static void client_receive_thread(int port) {
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
     // Send JOIN until the host accepts.
-    char join[32];
-    snprintf(join, sizeof(join), "JOIN x4mp\n");
+    char join[220];
+    snprintf(join, sizeof(join), "JOIN x4mp %s %s\n", g_client_key.c_str(), g_client_name.c_str());
     for (int i = 0; i < 10 && g_streams_running; i++) {
         sendto(sock, join, strlen(join), 0, (struct sockaddr*)&sa, sizeof(sa));
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -1025,6 +1123,40 @@ static void net_maintain_universe() {
     if (!g_game || !g_game->GetAllFactions || !g_game->GetAllFactionShips) return;
     if (!g_game->GetPlayerObjectID || !g_game->GetContextByClass) return;
 
+    // --- Restore persistent client stations (host-side state file) ---
+    // Load once, then re-create recorded stations after the universe is ready
+    // and their sectors are mapped. Keeps client assets across sessions without
+    // relying on the game save (no save pollution). Skips already-placed ones.
+    if (g_net_host && g_universe_ready && !g_state_restored && g_game->SpawnObjectAtPos2) {
+        static bool state_loaded = false;
+        if (!state_loaded) { load_client_state(); state_loaded = true; }
+        bool all_placed = true;
+        int restored = 0;
+        for (auto& kv : g_client_state) {
+            for (auto& st : kv.second.stations) {
+                if (st.macro[0] == 0) continue;
+                std::string sig = station_sig(kv.first, st.macro, st.x, st.y, st.z, st.sector);
+                if (g_restored_sigs.count(sig)) continue; // already placed this session
+                UniverseID sector = (st.sector[0] && g_host_sector_by_macro.count(st.sector))
+                                    ? g_host_sector_by_macro[st.sector] : 0;
+                if (!sector) { all_placed = false; continue; } // sector not mapped yet; retry
+                char f[80]; key_faction(kv.first, f, sizeof(f));
+                if (!f[0]) { all_placed = false; continue; }
+                UIPosRot pos; pos.x=st.x; pos.y=st.y; pos.z=st.z; pos.yaw=st.yaw; pos.pitch=st.pitch; pos.roll=st.roll;
+                UniverseID stn = g_game->SpawnObjectAtPos2(st.macro, sector, pos, f);
+                g_restored_sigs.insert(sig);
+                if (stn) { g_host_only_objects.insert(stn); g_persistent_station_objs.insert(stn); restored++; }
+            }
+        }
+        if (all_placed) {
+            g_state_restored = true;
+            char buf[200];
+            snprintf(buf, sizeof(buf), "x4mp: restored %d persistent client station(s) from state (%zu recorded clients, %zu stations)",
+                     restored, g_client_state.size(), g_restored_sigs.size());
+            net_log(buf);
+        }
+    }
+
     g_zone_objs.clear();
     g_zone_objs_zone = 0;
 
@@ -1054,6 +1186,7 @@ static void net_maintain_universe() {
             auto stnit = g_client_stations.find(it->first);
             if (stnit != g_client_stations.end()) {
                 for (UniverseID stn : stnit->second) {
+                    if (g_persistent_station_objs.count(stn)) continue; // persistent: keep across sessions
                     if (stn && g_game->IsValidComponent && g_game->IsValidComponent(stn))
                         g_game->RemoveComponent(stn);
                 }
@@ -1608,11 +1741,17 @@ static void host_apply_trade(UniverseID station, const std::vector<std::pair<std
 static void process_message(const char* msg, const struct sockaddr_in& from) {
     if (g_net_host) {
         if (strncmp(msg, "JOIN", 4) == 0) {
+            // Optional persistent identity: "JOIN x4mp <key> <name>". Older
+            // clients send just "JOIN x4mp" (empty key/name) — parse is tolerant.
+            char jkey[80] = {0}, jname[80] = {0};
+            sscanf(msg, "JOIN x4mp %79s %79s", jkey, jname);
             NetClient* c = find_client(from);
             if (!c) {
                 NetClient nc;
                 nc.addr = from;
                 nc.last_seen = std::chrono::steady_clock::now();
+                snprintf(nc.client_key, sizeof(nc.client_key), "%s", jkey);
+                snprintf(nc.client_name, sizeof(nc.client_name), "%s", jname);
                 // Assign this client a UNIQUE, never-reused player faction so
                 // it is distinguishable from the host and from every other
                 // client (supports many simultaneous clients, e.g. 8).
@@ -1626,16 +1765,27 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
                 char resp[64];
                 snprintf(resp, sizeof(resp), "WELCOME %d\n", id);
                 net_send(&from, resp);
-                char lbuf[192];
-                snprintf(lbuf, sizeof(lbuf), "x4mp: net: client joined (id=%d, %s:%u) faction=%s", id,
+                char lbuf[320];
+                snprintf(lbuf, sizeof(lbuf), "x4mp: net: client joined (id=%d, %s:%u) faction=%s name=%s key=%s", id,
                          inet_ntoa(from.sin_addr), (unsigned)ntohs(from.sin_port),
-                         g_clients.back().faction);
+                         g_clients.back().faction, g_clients.back().client_name,
+                         g_clients.back().client_key);
                 net_log(lbuf);
             } else {
                 // Re-join from an existing client (e.g. after a link drop):
                 // refresh liveness and re-send WELCOME so the client can
-                // re-establish its session id.
+                // re-establish its session id. In consolidated TCP mode the
+                // client is registered at ACCEPT, so its first JOIN lands here
+                // — log the identity once when the key first arrives.
                 c->last_seen = std::chrono::steady_clock::now();
+                if (jkey[0] && strcmp(c->client_key, jkey) != 0) {
+                    snprintf(c->client_key,  sizeof(c->client_key),  "%s", jkey);
+                    snprintf(c->client_name, sizeof(c->client_name), "%s", jname);
+                    char ibuf[220];
+                    snprintf(ibuf, sizeof(ibuf), "x4mp: net: client identity id=%d name=%s key=%s",
+                             c->id, c->client_name, c->client_key);
+                    net_log(ibuf);
+                }
                 int id = c->id;
                 char resp[64];
                 snprintf(resp, sizeof(resp), "WELCOME %d\n", id);
@@ -1693,10 +1843,13 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
                     if (!sector && g_game->GetPlayerZoneID && g_game->GetContextByClass)
                         sector = g_game->GetContextByClass(g_game->GetPlayerZoneID(), "sector", false);
                     uint64_t key = ((uint64_t)from.sin_addr.s_addr << 16) | (uint32_t)ntohs(from.sin_port);
-                    // Lazy faction computation (JOIN-time assignment is too
-                    // early — the universe may not exist yet).
+                    // Persistence identity: prefer the client's stable key (from
+                    // JOIN); fall back to IP:port for clients without one.
+                    std::string pkey = (c && c->client_key[0]) ? c->client_key : std::to_string(key);
+                    // Stable faction for the key (recorded on first use, reused
+                    // after) so a reconnecting client keeps the same faction.
                     char cfaction[80];
-                    client_faction_for(c ? c->id : 1, cfaction, sizeof(cfaction));
+                    key_faction(pkey, cfaction, sizeof(cfaction));
                     UIPosRot pos; pos.x = x; pos.y = y; pos.z = z;
                     pos.yaw = yaw; pos.pitch = pitch; pos.roll = roll;
                     std::vector<UniverseID>& spawned = g_client_stations[key];
@@ -1704,11 +1857,25 @@ static void process_message(const char* msg, const struct sockaddr_in& from) {
                     if (spawned[seq] == 0 && sector && cfaction[0]) {
                         UniverseID stn = g_game->SpawnObjectAtPos2(macro[0] ? macro : "?", sector, pos, cfaction);
                         spawned[seq] = stn; // remember even if 0 (avoid spawn retry storms)
-                        if (stn) g_host_only_objects.insert(stn);
+                        if (stn) {
+                            g_host_only_objects.insert(stn);
+                            // Persistent: record it for re-creation across sessions and
+                            // exclude it from disconnect removal (see prune pass).
+                            g_persistent_station_objs.insert(stn);
+                            g_restored_sigs.insert(station_sig(pkey, macro, x, y, z, csector));
+                            if (c && c->client_name[0])
+                                snprintf(g_client_state[pkey].name, sizeof(g_client_state[pkey].name), "%s", c->client_name);
+                            PersistentStation ps;
+                            snprintf(ps.macro,  sizeof(ps.macro),  "%s", macro[0] ? macro : "?");
+                            snprintf(ps.sector, sizeof(ps.sector), "%s", csector);
+                            ps.x=x; ps.y=y; ps.z=z; ps.yaw=yaw; ps.pitch=pitch; ps.roll=roll;
+                            g_client_state[pkey].stations.push_back(ps);
+                            save_client_state();
+                        }
                         if (g_debug) {
                             char dbg[300];
-                            snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST spawned client station ghost seq=%u id=%llu macro=%s sector=%llu faction=%s",
-                                     seq, (unsigned long long)stn, macro, (unsigned long long)sector, cfaction);
+                            snprintf(dbg, sizeof(dbg), "x4mp: [DBG] HOST spawned client station seq=%u id=%llu macro=%s sector=%llu faction=%s key=%s",
+                                     seq, (unsigned long long)stn, macro, (unsigned long long)sector, cfaction, pkey.c_str());
                             net_debug(dbg);
                         }
                     }
@@ -2308,6 +2475,29 @@ static void net_update() {
                     }
                 }
             }
+            // Phase 2b: stream PERSISTENT client stations back to all clients so
+            // they are visible even on a fresh save. The client dedups (its own
+            // local copy from the same save is kept, a fresh save spawns a ghost).
+            // A stable synthetic id (FNV of the station signature) keeps RemoteObj
+            // tracking + last_update fresh across the ~10 s re-sends.
+            if (g_net_tick % 200 == 0 && !g_client_state.empty()) {
+                for (auto& kv : g_client_state) {
+                    if (!kv.second.faction[0]) continue;
+                    for (auto& st : kv.second.stations) {
+                        if (st.macro[0] == 0) continue;
+                        std::string sig = station_sig(kv.first, st.macro, st.x, st.y, st.z, st.sector);
+                        uint64_t id = 14695981039346656037ull;
+                        for (unsigned char ch : sig) { id ^= ch; id *= 1099511628211ull; }
+                        id += 0x100000; // keep clear of real universe ids / 0
+                        char b[420];
+                        snprintf(b, sizeof(b), "STA %llu %s %.3f %.3f %.3f %.3f %.3f %.3f %s %s\n",
+                                 (unsigned long long)id, st.sector[0] ? st.sector : "?",
+                                 st.x, st.y, st.z, st.yaw, st.pitch, st.roll,
+                                 kv.second.faction, st.macro);
+                        net_send_stream(b);
+                    }
+                }
+            }
         }
         // Maintain per-client TCP stream connections (connect / reconnect).
         // (Skipped for UDP — no TCP connection is used for the data stream; and
@@ -2361,7 +2551,11 @@ static void net_update() {
         }
         // Send a JOIN until we're connected (re-sent after a link drop).
         if (!g_net_connected) {
-            if ((g_net_tick % 60) == 0) net_send_client("JOIN x4mp\n");
+            if ((g_net_tick % 60) == 0) {
+                char jm[220];
+                snprintf(jm, sizeof(jm), "JOIN x4mp %s %s\n", g_client_key.c_str(), g_client_name.c_str());
+                net_send_client(jm);
+            }
         } else {
             // Tell the host our dedicated stream port once (x4mp_stream).
             if (!g_stream_reported) {
@@ -2487,6 +2681,10 @@ static const int64_t   g_join_delay_ms = 20000;
 
 static void read_config() {
     const char* auto_mode = std::getenv("X4MP_AUTO");
+    const char* ck = std::getenv("X4MP_CLIENT_KEY");
+    if (ck) g_client_key = ck;
+    const char* cn = std::getenv("X4MP_CLIENT_NAME");
+    if (cn) g_client_name = cn;
     if (auto_mode) g_auto = auto_mode;
     const char* ta = std::getenv("X4MP_TEST_ACTION");
     if (ta && *ta == '1') g_test_action = true;

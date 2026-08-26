@@ -9,14 +9,10 @@
 // Uses C++23 std::format — no external dependencies.
 // ---------------------------------------------------------------------------
 
-#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include "common/windows_shim.h"
-#else
-#include "common/winfile_shim.h"
-#endif
+#include <windows.h>
 
 #include <format>
 #include <string>

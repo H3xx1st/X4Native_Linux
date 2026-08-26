@@ -19,15 +19,6 @@
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-// Serializes ALL core load/reload/dlopen/dlclose/dlsym operations. X4 can
-// re-enter luaopen_x4native() from worker threads (e.g. the "Movement worker"
-// spawned when NewMultiplayerGame starts a universe). Without this lock, two
-// threads can run load_core() concurrently: both copy_file() to the same
-// x4native_core_live.so and dlopen() it while the other is still reading it,
-// corrupting the module and causing a SIGSEGV inside dlsym()/ld-linux.
-// recursive so reload_core() may call load_core() without deadlocking.
-static std::recursive_mutex g_core_mutex;
-
 static lua_State*       g_lua            = nullptr;
 static void*            g_core_module    = nullptr;
 static CoreDispatch     g_dispatch       = {};
@@ -156,16 +147,15 @@ static std::string detect_ext_root() {
 // Core .so loading
 // ---------------------------------------------------------------------------
 static bool load_core() {
-    std::lock_guard<std::recursive_mutex> lock(g_core_mutex);
-    // Load the ORIGINAL core .so directly. We deliberately do NOT copy it to a
-    // shared "live" path first: multiple proxy instances (X4 can dlopen the
-    // proxy several times / re-enter it from worker threads) all used to
-    // copy_file() to the SAME x4native_core_live.so concurrently, corrupting
-    // the file while another thread was dlopen()ing it -> SIGSEGV inside
-    // dlsym()/ld-linux when NewMultiplayerGame spawns a "Movement worker" that
-    // re-enters luaopen_x4native(). dlopen() of the original path is safe
-    // (glibc refcounts the same inode; no file is rewritten).
-    g_core_module = dlopen(g_core_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    try {
+        std::filesystem::copy_file(g_core_path, g_core_live_path,
+                                   std::filesystem::copy_options::overwrite_existing);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "X4Native proxy: copy_file failed for core .so: %s\n", e.what());
+        return false;
+    }
+
+    g_core_module = dlopen(g_core_live_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!g_core_module) {
         fprintf(stderr, "X4Native proxy: dlopen failed for core .so: %s\n", dlerror());
         return false;
@@ -211,7 +201,6 @@ static bool load_core() {
 }
 
 static bool reload_core() {
-    std::lock_guard<std::recursive_mutex> lock(g_core_mutex);
     if (g_dispatch.prepare_reload)
         g_dispatch.prepare_reload();
 
@@ -251,12 +240,13 @@ static bool reload_core_guarded() noexcept {
 }
 
 static bool core_needs_reload() {
-    // With the proxy now dlopen()ing the original core path directly, there is
-    // no separate live copy to compare against. Auto-reload is off by default
-    // (x4native_settings.json autoreload=false); manual reload via the Lua
-    // reload() API still works. So never force a reload on re-entry.
-    (void)g_core_live_path;
-    return false;
+    auto disk_mtime = std::filesystem::last_write_time(g_core_path);
+    try {
+        auto live_mtime = std::filesystem::last_write_time(g_core_live_path);
+        return disk_mtime > live_mtime;
+    } catch (...) {
+        return true;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -638,7 +628,6 @@ int luaopen_x4native(lua_State* L) {
 // ---------------------------------------------------------------------------
 __attribute__((destructor))
 static void proxy_destructor() {
-    std::lock_guard<std::recursive_mutex> lock(g_core_mutex);
     if (g_core_shutdown)
         g_core_shutdown();
     if (g_core_module) {

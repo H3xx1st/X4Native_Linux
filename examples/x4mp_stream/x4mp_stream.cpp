@@ -90,6 +90,9 @@ struct RemoteObj {
     // pinning loop moves it toward (tx,ty,tz) at g_glide_speed. Far diverged
     // ships (offscreen) snap instantly.
     bool gliding = false;
+    // H1 (hybrid): promoted to a host-driven ghost because its local sim
+    // diverged beyond the cap. Once set, render_pass never rebinds it.
+    bool ghost_forced = false;
 };
 
 static std::unordered_map<unsigned long long, RemoteObj> g_objs;
@@ -144,6 +147,9 @@ static int g_sub_md_owner = -1;
 struct BoardingEvt { uint64_t entity; uint64_t op; bool started; }; // started=true (41) / false (40)
 static std::vector<BoardingEvt> g_boarding_evt;
 static std::unordered_set<UniverseID> g_boarding_exempt;
+// H1 (hybrid): ghosts promoted from diverged local ships. Excluded from the local
+// index so they can't be picked as binding candidates (they render as host ghosts).
+static std::unordered_set<UniverseID> g_ghost_forced_ids;
 static int g_sub_md_bd_start = -1, g_sub_md_bd_remove = -1;
 
 // ---- Trading: player cargo replication (diff-based) ----------------------
@@ -178,6 +184,17 @@ static float g_max_lag_m = 300.0f;     // X4MP_MAX_LAG_M: max interpolation lag 
 // ships still snap, since their teleport is not visible.
 static float g_glide_speed = 1500.0f;  // X4MP_GLIDE_SPEED: m/s a diverged ship may glide
 static float g_glide_max_m = 20000.0f; // X4MP_GLIDE_MAX: divergence above this snaps instantly
+
+// H1/H2 (HYBRID-ONLY, !g_inert && !g_ghosts): local AI fights the host pin
+// (tug-of-war). A bound ship whose local sim has dragged it farther than
+// g_hybrid_ghost_m from its host target is promoted to a host-driven ghost
+// (RemoveComponent + re-render as ghost) instead of being snapped back, which
+// would teleport visibly. Moderate corrections are soft-pinned (velocity
+// capped at g_soft_pin_speed) so slow corrections glide rather than jitter.
+static bool  g_hybrid_ghost = true;      // X4MP_HYBRID_GHOST=1/0 (master switch)
+static float g_hybrid_ghost_m = 3000.0f; // X4MP_HYBRID_GHOST_M: divergence cap -> ghost
+static float g_soft_pin_speed = 3000.0f; // X4MP_SOFT_PIN_SPEED: max correction speed (m/s)
+static float g_soft_pin_min = 50.0f;     // X4MP_SOFT_PIN_MIN: snap corrections under this
 static bool g_converged = false;        // entry convergence done for the current sector
 // X4MP_CONVERGE_GREEDY (default 1): on sector entry, bind each host ship to the
 // NEAREST same-macro local ship regardless of distance. Inactive sectors diverge
@@ -377,6 +394,7 @@ struct PlayerShipIDs {
 static void rebuild_local_index(UniverseID sector) {
     g_index_ships.clear();
     g_index_by_macro.clear();
+    g_ghost_forced_ids.clear(); // promoted ghosts from the prior sector are dropped
     g_bindings.clear();
     g_bound_locals.clear();
     g_missing_since.clear();
@@ -429,6 +447,7 @@ static void rebuild_local_index(UniverseID sector) {
             // suppressed nor pruned) — it must stay simulated to keep the
             // client's sector active.
             if (strstr(macro, "satellite")) continue;
+            if (g_ghost_forced_ids.count(s)) continue; // H1 promoted ghost: host-driven, not a binding candidate
             if (!indexed.insert(s).second) { dupes++; continue; }
             size_t idx = g_index_ships.size();
             g_index_ships.push_back(s);
@@ -1159,6 +1178,23 @@ static void render_pass() {
         // ghost) when the client leaves the sector, so it re-spawns on return.
         if (o.is_station) {
             if (!o.spawned) {
+                // Phase 2b dedup: if a local station (from our save) already sits at
+                // this spot with the same macro, track it instead of spawning a
+                // duplicate ghost. On a fresh save there is no local copy, so the
+                // ghost is spawned and the station becomes visible.
+                UniverseID existing = find_station_by_trade(0, pos.x, pos.y, pos.z);
+                if (existing && g_game->IsValidComponent(existing)) {
+                    char lm[160]; get_macro(existing, lm, sizeof(lm));
+                    if (o.macro[0] && lm[0] && strcmp(o.macro, lm) == 0) {
+                        o.client_id = existing;
+                        o.spawned = true;
+                        char dbg[200];
+                        snprintf(dbg, sizeof(dbg), "x4mp_stream: [DBG] STA dedup: local station %llu (macro=%s) already here; kept, skipped ghost",
+                                 (unsigned long long)existing, lm);
+                        net_log(dbg);
+                        continue;
+                    }
+                }
                 UniverseID newid = g_game->SpawnObjectAtPos2(o.macro, target_sector, pos,
                                                             (o.faction[0]) ? o.faction : "player");
                 if (newid != 0) {
@@ -1178,7 +1214,9 @@ static void render_pass() {
         // Bind this host ship to the matching local ship and keep the local
         // ship on the host's position. PLAYER ghosts never bind (they are
         // human ships rendered as ghosts on top of the local universe).
-        if (!o.is_player) {
+        // ghost_forced (H1 hybrid): already promoted to a host ghost — skip the
+        // binding so it renders via the ghost path below and never re-localizes.
+        if (!o.is_player && !o.ghost_forced) {
             if (g_full_received && !g_converged) g_cv_host++;
             UniverseID local = 0;
             auto bit = g_bindings.find(kv.first);
@@ -1279,6 +1317,9 @@ static void render_pass() {
             if (newid != 0) {
                 o.client_id = newid;
                 o.spawned = true;
+                // ghost_forced (H1 hybrid): freeze the (re)spawned ghost so its own
+                // local AI can't run and re-diverge (g_inert is off in hybrid).
+                if (o.ghost_forced && g_game->ActivateObject) g_game->ActivateObject(newid, false);
                 spawned_total++;
                 g_flk_spawn++;
                 if (g_full_received && !g_converged) g_cv_ghost++;
@@ -1298,10 +1339,11 @@ static void render_pass() {
                     snprintf(dbg, sizeof(dbg), "x4mp_stream: [DBG] ghost id=%llu became invalid; respawning", (unsigned long long)o.client_id);
                     net_log(dbg);
                 }
+                if (o.ghost_forced) g_ghost_forced_ids.erase(o.client_id);
                 o.spawned = false; // ghost was destroyed; respawn next pass
                 continue;
             }
-            if (g_inert && g_game->ActivateObject && !g_boarding_exempt.count(o.client_id))
+            if ((g_inert || o.ghost_forced) && g_game->ActivateObject && !g_boarding_exempt.count(o.client_id))
                 g_game->ActivateObject(o.client_id, false);
             g_game->SetObjectSectorPos(o.client_id, target_sector, pos);
         }
@@ -1533,6 +1575,46 @@ static void pin_bound_pass() {
             auto it = g_sector_map.find(o.sector_macro);
             if (it != g_sector_map.end()) target_sector = it->second;
         }
+
+        // H1/H2 (hybrid-only): the local sim has moved this ship away from its
+        // host target. Diverged beyond the cap -> promote to a host-driven ghost
+        // (RemoveComponent + re-render) instead of teleporting it back. Moderate
+        // corrections -> soft-pin (velocity-capped) so slow corrections glide.
+        if (!g_inert && !g_ghosts && g_hybrid_ghost && g_game->GetObjectPositionInSector) {
+            UIPosRot cur = g_game->GetObjectPositionInSector(local);
+            float mx = pos.x - cur.x, my = pos.y - cur.y, mz = pos.z - cur.z;
+            float dist = fsq(mx*mx + my*my + mz*mz);
+            if (dist > g_hybrid_ghost_m) {
+                g_bindings.erase(kv.first);
+                g_bound_locals.erase(local);
+                if (g_game->IsValidComponent(local)) g_game->RemoveComponent(local);
+                o.ghost_forced = true;
+                // Spawn the host-driven ghost immediately (no removal->respawn gap)
+                // and freeze it: in hybrid g_inert is off, so without an explicit
+                // freeze the new ghost's own local AI would run and diverge again.
+                UniverseID gid = g_game->SpawnObjectAtPos2(o.macro, target_sector, pos,
+                                                          (o.faction[0]) ? o.faction : "player");
+                o.client_id = gid;
+                o.spawned = (gid != 0);
+                if (gid) g_ghost_forced_ids.insert(gid);
+                if (gid && g_game->ActivateObject) g_game->ActivateObject(gid, false);
+                char dbg[220];
+                snprintf(dbg, sizeof(dbg), "x4mp_stream: [DBG] HYBRID ghost host=%llu local=%llu macro=%s dist=%.0fm -> host-driven (ghost %llu)",
+                         (unsigned long long)kv.first, (unsigned long long)local, o.macro, dist, (unsigned long long)gid);
+                net_log(dbg);
+                continue;
+            }
+            if (dist > g_soft_pin_min) {
+                float maxstep = g_soft_pin_speed * g_render_dt;
+                if (maxstep > 0.0f && maxstep < dist) {
+                    float s = maxstep / dist;
+                    pos.x = cur.x + mx * s;
+                    pos.y = cur.y + my * s;
+                    pos.z = cur.z + mz * s;
+                }
+            }
+        }
+
         if (g_inert && g_game->ActivateObject && !g_boarding_exempt.count(local))
             g_game->ActivateObject(local, false);
         g_game->SetObjectSectorPos(local, target_sector, pos);
@@ -1878,6 +1960,15 @@ X4NATIVE_EXPORT int x4native_init(X4NativeAPI* api) {
     if (gs) { float v = (float)atof(gs); if (v >= 50.0f && v <= 20000.0f) g_glide_speed = v; }
     const char* gm = std::getenv("X4MP_GLIDE_MAX");
     if (gm) { float v = (float)atof(gm); if (v >= 1000.0f && v <= 500000.0f) g_glide_max_m = v; }
+    // H1/H2 (hybrid-only divergence handling).
+    const char* hg = std::getenv("X4MP_HYBRID_GHOST");
+    if (hg) g_hybrid_ghost = (atoi(hg) != 0);
+    const char* hmm = std::getenv("X4MP_HYBRID_GHOST_M");
+    if (hmm) { float v = (float)atof(hmm); if (v >= 500.0f && v <= 500000.0f) g_hybrid_ghost_m = v; }
+    const char* sps = std::getenv("X4MP_SOFT_PIN_SPEED");
+    if (sps) { float v = (float)atof(sps); if (v >= 50.0f && v <= 50000.0f) g_soft_pin_speed = v; }
+    const char* spm = std::getenv("X4MP_SOFT_PIN_MIN");
+    if (spm) { float v = (float)atof(spm); if (v >= 5.0f && v <= 10000.0f) g_soft_pin_min = v; }
     const char* reg = std::getenv("X4MP_REGION");
     if (reg && *reg == '1') g_region = true;
     const char* rm = std::getenv("X4MP_REGION_M");

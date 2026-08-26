@@ -14,11 +14,7 @@
 #include <x4_game_func_table.h>
 #include <x4_game_offsets.h>
 #include <x4_manual_types.h>
-#ifdef _WIN32
 #include <MinHook.h>
-#else
-#include "common/minhook_shim.h"
-#endif
 
 #include <array>
 #include <cstdio>
@@ -188,7 +184,7 @@ static bool install_frame_tick_hook() {
     }
     if (!g_x4_base) return false;
 
-    MH_STATUS status = MH_CreateHook(target, reinterpret_cast<void*>(&frame_tick_detour), &g_frame_tick_trampoline);
+    MH_STATUS status = MH_CreateHook(target, &frame_tick_detour, &g_frame_tick_trampoline);
     if (status != MH_OK) {
         x4n::Logger::error("Native frame hook: MH_CreateHook failed: {}", MH_StatusToString(status));
         return false;
@@ -241,7 +237,7 @@ static bool install_radar_visibility_hook() {
         return false;
     }
 
-    MH_STATUS status = MH_CreateHook(target, reinterpret_cast<void*>(&radar_event_detour), &g_radar_event_trampoline);
+    MH_STATUS status = MH_CreateHook(target, &radar_event_detour, &g_radar_event_trampoline);
     if (status != MH_OK) {
         x4n::Logger::error("Radar visibility hook: MH_CreateHook failed: {}", MH_StatusToString(status));
         return false;
@@ -318,7 +314,7 @@ static bool install_md_event_hook() {
         return false;
     }
 
-    MH_STATUS status = MH_CreateHook(target, reinterpret_cast<void*>(&md_event_dispatch_detour), &g_md_event_trampoline);
+    MH_STATUS status = MH_CreateHook(target, &md_event_dispatch_detour, &g_md_event_trampoline);
     if (status != MH_OK) {
         x4n::Logger::error("MD event hook: MH_CreateHook failed: {}", MH_StatusToString(status));
         return false;
