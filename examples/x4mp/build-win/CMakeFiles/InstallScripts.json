@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/lunarbuntu/Programming/x4-pack/X4-C++-Extension-Linux/source-code/X4Native/examples/x4mp/build-win/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

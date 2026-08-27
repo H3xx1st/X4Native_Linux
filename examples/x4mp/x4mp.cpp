@@ -64,15 +64,7 @@
 #include <cstdio>
 #include <chrono>
 #include <vector>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <cerrno>
-#include <dirent.h>
+#include "../x4mp_platform.h"
 #include <unordered_map>
 #include <unordered_set>
 #include <thread>
@@ -268,6 +260,7 @@ static std::string station_sig(const std::string& key, const char* macro, float 
 static void ensure_state_dir() {
     if (!g_state_path.empty()) return;
     const char* home = getenv("HOME");
+    if (!home) home = getenv("USERPROFILE"); // Windows: HOME is usually unset
     if (!home) return;
     char cfg[512];
     snprintf(cfg, sizeof(cfg), "%s/.config", home);
@@ -3266,6 +3259,7 @@ X4NATIVE_EXPORT int x4native_api_version(void) {
 
 X4NATIVE_EXPORT int x4native_init(X4NativeAPI* api) {
     g_api = api;
+    x4mp_sock_ensure_init(); // WinSock WSAStartup (no-op on Linux)
     read_config();
     g_game = api->game;
     g_start = std::chrono::steady_clock::now();

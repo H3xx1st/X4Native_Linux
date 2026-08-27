@@ -28,14 +28,7 @@
 #include <string>
 #include <chrono>
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <cerrno>
+#include "../x4mp_platform.h"
 
 // GLIBC compatibility: avoid sqrtf, which resolves to GLIBC_2.43 and prevents
 // the extension from loading on older glibc (e.g. Ubuntu 24.04 ships 2.39).
@@ -48,7 +41,9 @@ static inline float fsq(float v) { return (float)sqrt((double)v); }
 // Ubuntu 24.04's 2.39). This resolves to sqrt@GLIBC_2.2.5, present on every
 // glibc, with identical results. Interposing a correctly-computing math function
 // is safe.
+#if !defined(_WIN32)
 extern "C" float sqrtf(float x) { return (float)sqrt((double)x); }
+#endif
 
 static X4NativeAPI*    g_api  = nullptr;
 static X4GameFunctions* g_game = nullptr;
@@ -1914,6 +1909,7 @@ X4NATIVE_EXPORT int x4native_api_version(void) { return 1; }
 
 X4NATIVE_EXPORT int x4native_init(X4NativeAPI* api) {
     g_api = api;
+    x4mp_sock_ensure_init(); // WinSock WSAStartup (no-op on Linux)
     g_game = api->game;
 
     const char* sp = std::getenv("X4MP_STREAM_PORT");
