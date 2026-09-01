@@ -16,6 +16,7 @@ add_library(x4llm SHARED x4llm.cpp)
 target_include_directories(x4llm PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../sdk
     ${CMAKE_CURRENT_SOURCE_DIR}/../../sdk/sdk
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party
 )
 
 if(WIN32)

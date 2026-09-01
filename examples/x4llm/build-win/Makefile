@@ -57,10 +57,10 @@ RM = /usr/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /home/lunarbuntu/Programming/x4-pack-windows/X4-C++-Extension-Windows/source-code/X4Native/examples/x4llm
+CMAKE_SOURCE_DIR = /home/lunarbuntu/Programming/x4-pack/X4-C++-Extension-Linux/source-code/X4Native/examples/x4llm
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /home/lunarbuntu/Programming/x4-pack-windows/X4-C++-Extension-Windows/source-code/X4Native/examples/x4llm/build-win
+CMAKE_BINARY_DIR = /home/lunarbuntu/Programming/x4-pack/X4-C++-Extension-Linux/source-code/X4Native/examples/x4llm/build-win
 
 #=============================================================================
 # Targets provided globally by CMake.
@@ -87,9 +87,9 @@ rebuild_cache/fast: rebuild_cache
 
 # The main all target
 all: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/lunarbuntu/Programming/x4-pack-windows/X4-C++-Extension-Windows/source-code/X4Native/examples/x4llm/build-win/CMakeFiles /home/lunarbuntu/Programming/x4-pack-windows/X4-C++-Extension-Windows/source-code/X4Native/examples/x4llm/build-win//CMakeFiles/progress.marks
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/lunarbuntu/Programming/x4-pack/X4-C++-Extension-Linux/source-code/X4Native/examples/x4llm/build-win/CMakeFiles /home/lunarbuntu/Programming/x4-pack/X4-C++-Extension-Linux/source-code/X4Native/examples/x4llm/build-win//CMakeFiles/progress.marks
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 all
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/lunarbuntu/Programming/x4-pack-windows/X4-C++-Extension-Windows/source-code/X4Native/examples/x4llm/build-win/CMakeFiles 0
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/lunarbuntu/Programming/x4-pack/X4-C++-Extension-Linux/source-code/X4Native/examples/x4llm/build-win/CMakeFiles 0
 .PHONY : all
 
 # The main clean target

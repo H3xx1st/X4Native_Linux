@@ -54,10 +54,10 @@ RM = /usr/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /home/lunarbuntu/Programming/x4-pack-windows/X4-C++-Extension-Windows/source-code/X4Native/examples/x4llm
+CMAKE_SOURCE_DIR = /home/lunarbuntu/Programming/x4-pack/X4-C++-Extension-Linux/source-code/X4Native/examples/x4llm
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /home/lunarbuntu/Programming/x4-pack-windows/X4-C++-Extension-Windows/source-code/X4Native/examples/x4llm/build-win
+CMAKE_BINARY_DIR = /home/lunarbuntu/Programming/x4-pack/X4-C++-Extension-Linux/source-code/X4Native/examples/x4llm/build-win
 
 #=============================================================================
 # Directory level rules for the build root directory
@@ -85,14 +85,14 @@ clean: CMakeFiles/x4llm.dir/clean
 CMakeFiles/x4llm.dir/all:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/x4llm.dir/build.make CMakeFiles/x4llm.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/x4llm.dir/build.make CMakeFiles/x4llm.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/lunarbuntu/Programming/x4-pack-windows/X4-C++-Extension-Windows/source-code/X4Native/examples/x4llm/build-win/CMakeFiles --progress-num=1,2 "Built target x4llm"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/lunarbuntu/Programming/x4-pack/X4-C++-Extension-Linux/source-code/X4Native/examples/x4llm/build-win/CMakeFiles --progress-num=1,2 "Built target x4llm"
 .PHONY : CMakeFiles/x4llm.dir/all
 
 # Build rule for subdir invocation for target.
 CMakeFiles/x4llm.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/lunarbuntu/Programming/x4-pack-windows/X4-C++-Extension-Windows/source-code/X4Native/examples/x4llm/build-win/CMakeFiles 2
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/lunarbuntu/Programming/x4-pack/X4-C++-Extension-Linux/source-code/X4Native/examples/x4llm/build-win/CMakeFiles 2
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/x4llm.dir/all
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/lunarbuntu/Programming/x4-pack-windows/X4-C++-Extension-Windows/source-code/X4Native/examples/x4llm/build-win/CMakeFiles 0
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/lunarbuntu/Programming/x4-pack/X4-C++-Extension-Linux/source-code/X4Native/examples/x4llm/build-win/CMakeFiles 0
 .PHONY : CMakeFiles/x4llm.dir/rule
 
 # Convenience name for target.
@@ -102,7 +102,7 @@ x4llm: CMakeFiles/x4llm.dir/rule
 # codegen rule for target.
 CMakeFiles/x4llm.dir/codegen:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/x4llm.dir/build.make CMakeFiles/x4llm.dir/codegen
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/lunarbuntu/Programming/x4-pack-windows/X4-C++-Extension-Windows/source-code/X4Native/examples/x4llm/build-win/CMakeFiles --progress-num=1,2 "Finished codegen for target x4llm"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/lunarbuntu/Programming/x4-pack/X4-C++-Extension-Linux/source-code/X4Native/examples/x4llm/build-win/CMakeFiles --progress-num=1,2 "Finished codegen for target x4llm"
 .PHONY : CMakeFiles/x4llm.dir/codegen
 
 # clean rule for target.

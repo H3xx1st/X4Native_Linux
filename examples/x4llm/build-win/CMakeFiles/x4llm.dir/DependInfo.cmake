@@ -8,7 +8,7 @@ set(CMAKE_DEPENDS_LANGUAGES
 
 # The set of dependency files which are needed:
 set(CMAKE_DEPENDS_DEPENDENCY_FILES
-  "/home/lunarbuntu/Programming/x4-pack-windows/X4-C++-Extension-Windows/source-code/X4Native/examples/x4llm/x4llm.cpp" "CMakeFiles/x4llm.dir/x4llm.cpp.obj" "gcc" "CMakeFiles/x4llm.dir/x4llm.cpp.obj.d"
+  "/home/lunarbuntu/Programming/x4-pack/X4-C++-Extension-Linux/source-code/X4Native/examples/x4llm/x4llm.cpp" "CMakeFiles/x4llm.dir/x4llm.cpp.obj" "gcc" "CMakeFiles/x4llm.dir/x4llm.cpp.obj.d"
   )
 
 # Targets to which this target links which contain Fortran sources.
