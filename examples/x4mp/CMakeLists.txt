@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Windows (MinGW cross-build): statically link the MinGW runtime so the DLL only
 # depends on Windows system libs (KERNEL32, UCRT, WS2_32). Must be set before
 # add_library() so it lands at the start of the shared link command.
-if(WIN32)
+if(MINGW)
     set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -static")
 endif()
 
@@ -43,4 +43,12 @@ if(BUILD_TESTING)
         target_link_libraries(x4mp_host_lifecycle_test PRIVATE Threads::Threads)
     endif()
     add_test(NAME x4mp_host_lifecycle COMMAND x4mp_host_lifecycle_test)
+    add_executable(x4mp_client_lifecycle_test tests/client_lifecycle.cpp)
+    target_include_directories(x4mp_client_lifecycle_test PRIVATE ../../sdk ../../sdk/sdk)
+    if(WIN32)
+        target_link_libraries(x4mp_client_lifecycle_test PRIVATE ws2_32)
+    else()
+        target_link_libraries(x4mp_client_lifecycle_test PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME x4mp_client_lifecycle COMMAND x4mp_client_lifecycle_test)
 endif()
