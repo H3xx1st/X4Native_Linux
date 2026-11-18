@@ -29,3 +29,18 @@ set_target_properties(x4mp PROPERTIES
     PREFIX ""
     OUTPUT_NAME "x4mp"
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(x4mp_host_lifecycle_test tests/host_lifecycle.cpp)
+    target_include_directories(x4mp_host_lifecycle_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../sdk
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../sdk/sdk
+    )
+    if(WIN32)
+        target_link_libraries(x4mp_host_lifecycle_test PRIVATE ws2_32)
+    else()
+        target_link_libraries(x4mp_host_lifecycle_test PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME x4mp_host_lifecycle COMMAND x4mp_host_lifecycle_test)
+endif()

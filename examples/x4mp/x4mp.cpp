@@ -2826,6 +2826,22 @@ static void do_host(const char* module, const char* difficulty) {
         g_api->log(X4NATIVE_LOG_WARN, "x4mp: host already started — ignoring duplicate request");
         return;
     }
+    // Our custom transport can host the world already loaded by the player or
+    // save loader. NewMultiplayerGame would replace it and reload the UI,
+    // destroying the runtime-selected role. Wait for the definitive readiness
+    // event before enabling streams, then preserve the existing universe.
+    if (g_game && g_game->IsPlayerValid && g_game->IsPlayerValid()) {
+        if (!g_universe_ready) {
+            g_host_pending = true;
+            return;
+        }
+        g_host_pending = false;
+        g_host_done = true;
+        net_start();
+        start_streams();
+        g_api->log(X4NATIVE_LOG_INFO, "x4mp: HOST — existing universe; custom transport active");
+        return;
+    }
     g_host_done = true;
     // Start the data-stream threads only AFTER the game is loaded (creating
     // them during init interferes with the game's startup and causes shutdown).
